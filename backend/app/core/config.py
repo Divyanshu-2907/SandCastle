@@ -11,7 +11,10 @@ class Settings(BaseSettings):
     app_name: str = "Sandcastle"
     environment: str = "development"
 
-    database_url: str = "postgresql+psycopg2://sandcastle:sandcastle@localhost:5432/sandcastle"
+    # Required, with no fallback on purpose. A default would have to embed
+    # credentials in source, and a wrong-but-working default fails silently by
+    # connecting somewhere unintended. Copy .env.example to .env to set it.
+    database_url: str
     redis_url: str = "redis://localhost:6379/0"
 
     celery_broker_url: str = "redis://localhost:6379/1"

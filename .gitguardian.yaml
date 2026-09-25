@@ -1,0 +1,19 @@
+# GitGuardian configuration.
+#
+# The matches below are local development defaults that ship deliberately, so
+# `docker compose up` works on a fresh clone. They are not credentials to
+# anything reachable: the Postgres they name runs in a container on the
+# developer's own machine and is never exposed beyond it.
+#
+# Real secrets (GEMINI_API_KEY, ANTHROPIC_API_KEY, a production JWT_SECRET) live
+# only in .env, which is gitignored and has never been committed.
+version: 2
+
+secret:
+  ignored-matches:
+    - name: Local dev Postgres credentials in the example connection string
+      match: sandcastle:sandcastle
+
+  ignored-paths:
+    # Documents which variables exist; every secret value in it is blank.
+    - .env.example
