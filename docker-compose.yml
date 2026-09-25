@@ -1,0 +1,129 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sandcastle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sandcastle}
+      POSTGRES_DB: ${POSTGRES_DB:-sandcastle}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/00-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sandcastle} -d ${POSTGRES_DB:-sandcastle}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-sandcastle}:${POSTGRES_PASSWORD:-sandcastle}@postgres:5432/${POSTGRES_DB:-sandcastle}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # The worker must create sibling containers, but handing it the raw Docker
+  # socket would give the component that runs untrusted code root-equivalent
+  # access to the host. It talks to this proxy instead, which exposes only the
+  # API sections below and refuses everything else.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      # Allowed: the container/volume/image lifecycle a run needs.
+      CONTAINERS: 1
+      VOLUMES: 1
+      IMAGES: 1
+      EXEC: 1
+      POST: 1
+      # Explicitly denied: everything that would let a caller reconfigure the
+      # daemon, reach other workloads, or read secrets.
+      NETWORKS: 0
+      SERVICES: 0
+      TASKS: 0
+      SWARM: 0
+      NODES: 0
+      SECRETS: 0
+      CONFIGS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      INFO: 0
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      DISTRIBUTION: 0
+      SESSION: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # No ports published: reachable only from inside the compose network.
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-sandcastle}:${POSTGRES_PASSWORD:-sandcastle}@postgres:5432/${POSTGRES_DB:-sandcastle}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # Never the raw socket -- see docker-socket-proxy above.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-sandcastle-sandbox:latest}
+      SANDBOX_MEMORY: ${SANDBOX_MEMORY:-512m}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-1.0}
+      SANDBOX_PIDS: ${SANDBOX_PIDS:-256}
+      SANDBOX_TIMEOUT: ${SANDBOX_TIMEOUT:-300}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    environment:
+      VITE_API_URL: http://localhost:${BACKEND_PORT:-8000}
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
