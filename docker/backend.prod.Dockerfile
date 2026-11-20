@@ -22,8 +22,13 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY backend/pyproject.toml /app/pyproject.toml
-RUN uv pip install --system -r /app/pyproject.toml
+# Installed from uv.lock so a rebuild cannot silently move a dependency; see
+# the same step in backend.Dockerfile for why. --no-dev: production has no use
+# for the test group.
+COPY backend/pyproject.toml backend/uv.lock /app/
+RUN uv export --frozen --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt \
+    && uv pip install --system -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 COPY backend /app
 
