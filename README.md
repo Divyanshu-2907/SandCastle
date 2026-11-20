@@ -116,6 +116,7 @@ defaults. Notable ones:
 - `JWT_SECRET` — **change this outside local dev**
 - `GEMINI_API_KEY` — required from Phase 2 on ([free key](https://aistudio.google.com/apikey))
 - `LLM_PROVIDER` / `AGENT_MODEL` — `gemini` + `gemini-2.5-flash` by default
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` — optional run tracing; off unless both are set
 
 
 
@@ -441,6 +442,87 @@ Crash cleanup is verified against a real `SIGKILL`:
 docker compose kill -s SIGKILL worker && docker compose start worker
 # worker-1 | reaped orphaned sandbox container sandcastle-run-...
 ```
+
+## Observability (Langfuse)
+
+Off by default. Set both keys and every agent run produces one Langfuse trace:
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+# Optional; blank means Langfuse Cloud. `LANGFUSE_BASE_URL` is read too.
+LANGFUSE_HOST=http://localhost:3000
+```
+
+With either key missing, `build_tracer` returns a `NoopTracer` and the SDK is
+never imported — so an unconfigured deployment pays nothing and reaches no
+network. Restart the worker after changing these; it has no hot-reload.
+
+### What a trace contains
+
+One trace per run, built from three kinds of observation:
+
+- **The run** is the root span, typed `agent`. Input is the task description and
+  `repo_url`; output is `final_message`, `stop_reason` and `error`. Its
+  `session_id` is the `Run` row's UUID verbatim, so pasting a run id into
+  Langfuse's search finds it. The trace id itself has to be 32 hex characters,
+  so it is seeded from the run id — stable for a given run, but not equal to it.
+  Tagged `model:<name>` and `provider:<gemini|anthropic>`.
+- **A `generation` per model turn**, named `turn-1`, `turn-2` and so on. Carries
+  the model name, input/output token usage, the text and thoughts returned, the
+  tool calls requested, and the turn's `stop_reason`. The span wraps the
+  provider call, so its duration is the real latency.
+- **A `tool` span per tool call**, named after the tool. Carries the arguments,
+  the result text, `is_error`, and `guardrail_blocked`. A call the guardrails
+  refused is logged at `WARNING` rather than `ERROR` — the sandbox doing its job
+  is not a fault — while a tool that raised is an `ERROR` with the exception on
+  the span.
+
+### Scores
+
+Four numeric scores land on the trace at the end of a run:
+
+| Score | Meaning |
+|---|---|
+| `run_completed` | `1` only when `error` is `None` **and** `stop_reason` is `end_turn`. Exhausting the step budget scores `0`: the agent stopped because it ran out of turns, not because it finished. |
+| `steps_used` | Model turns consumed — the thing `AGENT_MAX_STEPS` bounds. Not the number of steps emitted, since one turn can produce several thoughts and several tool calls. |
+| `tool_error_count` | Tool calls that failed. |
+| `guardrail_block_count` | Tool calls a guardrail refused. Counted here and *not* in `tool_error_count`, so one blocked call is not counted twice. |
+
+### What is redacted
+
+Payloads pass through `redact()` on the way out, and the same function is
+installed as the SDK's `mask` hook, so anything serialised on a path the loop
+does not know about is scrubbed too. It removes PEM private-key blocks, Google,
+Anthropic, OpenAI, GitHub, Slack and AWS key shapes, JWTs, and the value of any
+`name=value` pair whose name looks like a credential; a dict field named like a
+secret is replaced wholesale. Token *counts* are exempt by name, or
+`input_tokens` would be scrubbed for containing "token". `write_file` content is
+capped at 2,000 characters and tool output at 4,000.
+
+### Design notes
+
+Instrumented at the `AgentLoop` level rather than inside the provider clients,
+so one implementation covers Gemini and Anthropic and a trace looks the same
+either way. Every tracer call is wrapped: an exception from the tracer is logged
+and swallowed, the bargain `on_step` already makes. The wrapper also ignores the
+tracer's `__exit__` return value, so a tracer cannot suppress a real failure in
+the work it is observing. `run_agent_task` flushes at the end of the task,
+because Langfuse exports on a background thread and a returning Celery task can
+otherwise be recycled before the batch leaves.
+
+### Tests
+
+`backend/tests/test_tracing.py` — 32 tests over a `FakeTracer` and the scripted
+fake model: call counts and scores for a finished run, the step-limit path, the
+provider-failure path, a tracer that raises on every method not affecting the
+run, a tracer that cannot swallow a real error, `NoopTracer` as the default, and
+the redaction cases above. No Langfuse account or network needed.
+
+The `LangfuseTracer` itself was verified against langfuse 5.2.0 with an
+in-memory OpenTelemetry exporter — span shapes, trace grouping, usage details,
+levels and redaction. It has not yet been run against a live Langfuse project,
+so the export path over the wire is unproven.
 
 ## Roadmap
 

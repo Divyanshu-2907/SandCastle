@@ -126,7 +126,14 @@ class Toolbox:
         try:
             return handler(tool_input)
         except (PathOutsideWorkspace, CommandRejected) as exc:
-            return ToolResult(text=f"Rejected: {exc}", payload={"error": str(exc)}, is_error=True)
+            # The only place `blocked` is set: these two exceptions are the
+            # guardrails refusing, not a tool failing.
+            return ToolResult(
+                text=f"Rejected: {exc}",
+                payload={"error": str(exc)},
+                is_error=True,
+                blocked=True,
+            )
         except WorkspaceError as exc:
             detail = str(exc) or type(exc).__name__
             return ToolResult(text=detail, payload={"error": detail}, is_error=True)

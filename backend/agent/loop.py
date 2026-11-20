@@ -6,6 +6,7 @@ as it happens (Phase 3 streams them to Postgres and Redis from `on_step`).
 """
 
 import logging
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from agent.backends import LocalBackend, WorkspaceBackend
 from agent.llm import DEFAULT_PROVIDER, LLMClient, LLMError, ToolOutcome, build_client
 from agent.schemas import AgentResult, AgentStep
 from agent.tools import TOOL_DEFINITIONS, Toolbox
+from agent.tracing import NoopTracer, Tracer, guard, guard_tool, guard_turn
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,8 @@ class AgentLoop:
         backend: WorkspaceBackend | None = None,
         on_step: StepCallback | None = None,
         client: LLMClient | None = None,
+        run_id: str | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         # Either a local directory or a sandbox-backed workspace; the loop
         # never knows which.
@@ -78,6 +82,17 @@ class AgentLoop:
         self.model = model
         self.max_steps = max_steps
         self.on_step = on_step
+        # The worker passes the Run row's id, which becomes the trace's session
+        # id. The CLI has no such id, so one is minted to keep a local run's
+        # spans grouped together.
+        self.run_id = run_id or str(uuid.uuid4())
+        self.tracer: Tracer = tracer or NoopTracer()
+
+        # Scored at the end of the run, so they are counted where the calls
+        # happen rather than reconstructed from the step list afterwards.
+        self._turns_used = 0
+        self._tool_errors = 0
+        self._guardrail_blocks = 0
 
         if backend is None:
             if self.workspace is None:
@@ -129,21 +144,66 @@ class AgentLoop:
     # -- the loop ---------------------------------------------------------
 
     def run(self) -> AgentResult:
+        guard(
+            "start_run",
+            self.tracer.start_run,
+            run_id=self.run_id,
+            description=self.description,
+            repo_url=self.repo_url,
+            model=self.model,
+            provider=getattr(self.client, "provider", "unknown"),
+        )
+        # The trace is closed from a `finally` so it is closed exactly once, on
+        # every path -- including the crash path, where an unclosed trace would
+        # be the only record that the run ever started.
         try:
-            self.client.start(
-                USER_PROMPT.format(repo_url=self.repo_url, description=self.description)
+            try:
+                self.client.start(
+                    USER_PROMPT.format(repo_url=self.repo_url, description=self.description)
+                )
+                self._drive()
+            except LLMError as exc:
+                self._fail(str(exc))
+            except Exception as exc:  # noqa: BLE001 - the run fails, the worker survives
+                logger.exception("agent loop crashed")
+                self._fail(f"{type(exc).__name__}: {exc}")
+        finally:
+            guard(
+                "end_run",
+                self.tracer.end_run,
+                final_message=self._result.final_message,
+                stop_reason=self._result.stop_reason,
+                error=self._result.error,
+                # Model turns consumed, which is what `max_steps` bounds -- not
+                # the number of AgentSteps emitted, since one turn can emit
+                # several thoughts and several tool calls.
+                steps_used=self._turns_used,
+                tool_error_count=self._tool_errors,
+                guardrail_block_count=self._guardrail_blocks,
+                input_tokens=self._result.input_tokens,
+                output_tokens=self._result.output_tokens,
             )
-            self._drive()
-        except LLMError as exc:
-            self._fail(str(exc))
-        except Exception as exc:  # noqa: BLE001 - the run fails, the worker survives
-            logger.exception("agent loop crashed")
-            self._fail(f"{type(exc).__name__}: {exc}")
         return self._result
 
     def _drive(self) -> None:
         for turn in range(1, self.max_steps + 1):
-            response = self.client.advance()
+            # The span wraps the call rather than being written afterwards, so
+            # its duration is the model's actual latency.
+            with guard_turn(self.tracer, number=turn) as turn_trace:
+                response = self.client.advance()
+                self._turns_used = turn
+                turn_trace.record(
+                    model=self.model,
+                    thoughts=response.thoughts,
+                    text=response.text,
+                    tool_calls=[
+                        {"name": call.name, "arguments": call.arguments}
+                        for call in response.tool_calls
+                    ],
+                    stop_reason=response.stop_reason,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                )
 
             self._result.input_tokens += response.input_tokens
             self._result.output_tokens += response.output_tokens
@@ -181,7 +241,17 @@ class AgentLoop:
         for call in tool_calls:
             self._emit("action", tool_name=call.name, tool_input=call.arguments)
 
-            result = self.toolbox.dispatch(call.name, call.arguments)
+            with guard_tool(self.tracer, name=call.name, arguments=call.arguments) as tool_trace:
+                result = self.toolbox.dispatch(call.name, call.arguments)
+                tool_trace.record(
+                    text=result.text, is_error=result.is_error, blocked=result.blocked
+                )
+
+            if result.blocked:
+                self._guardrail_blocks += 1
+            elif result.is_error:
+                self._tool_errors += 1
+
             self._emit(
                 "observation",
                 content=result.text,

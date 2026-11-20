@@ -1,0 +1,131 @@
+# Runs on the GCE worker VM. Deployed to /opt/sandcastle/compose.yml by
+# worker-startup.sh, which also writes the .env beside it from Secret Manager.
+#
+# Why this is a VM and not Cloud Run: the worker's job is to create sibling
+# containers for each sandboxed agent run. Cloud Run gives a container no Docker
+# daemon and no privileged mode, so the sandbox layer cannot exist there. The
+# stateless API does fit Cloud Run, and that is where it runs.
+services:
+  # Keeps the Cloud SQL credentials out of the worker entirely: the worker
+  # connects to localhost and the proxy handles IAM auth and TLS.
+  cloudsql-proxy:
+    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+    command:
+      - "--address=0.0.0.0"
+      - "--port=5432"
+      - "${SQL_CONNECTION_NAME}"
+    restart: unless-stopped
+    healthcheck:
+      # The proxy image is distroless; /bin/sh exists but no nc/pg_isready, so
+      # probe the port with the proxy's own built-in health endpoint instead.
+      test: ["CMD", "/cloud-sql-proxy", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    # requirepass, and bound to the VM's internal interface only -- the Cloud Run
+    # API reaches it over direct VPC egress, nothing reaches it from outside.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "no"]
+    ports:
+      - "${REDIS_BIND:-127.0.0.1}:6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Same reasoning as in docker-compose.yml: the component that executes
+  # untrusted code never gets the raw Docker socket.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      CONTAINERS: 1
+      VOLUMES: 1
+      IMAGES: 1
+      EXEC: 1
+      POST: 1
+      NETWORKS: 0
+      SERVICES: 0
+      TASKS: 0
+      SWARM: 0
+      NODES: 0
+      SECRETS: 0
+      CONFIGS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      INFO: 0
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      DISTRIBUTION: 0
+      SESSION: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  worker:
+    image: ${WORKER_IMAGE}
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@cloudsql-proxy:5432/${DB_NAME}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE}
+      SANDBOX_MEMORY: ${SANDBOX_MEMORY:-512m}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-1.0}
+      SANDBOX_PIDS: ${SANDBOX_PIDS:-256}
+      SANDBOX_TIMEOUT: ${SANDBOX_TIMEOUT:-300}
+      JWT_SECRET: ${JWT_SECRET}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      AGENT_MODEL: ${AGENT_MODEL:-gemini-2.5-flash}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_RPM: ${GEMINI_RPM:-10}
+      ENVIRONMENT: production
+    depends_on:
+      redis:
+        condition: service_healthy
+      cloudsql-proxy:
+        condition: service_started
+      docker-socket-proxy:
+        condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: gcplogs
+
+  # The schedule in app/worker.py only fires if something runs beat. Exactly
+  # one process must: two beats means two sweeps per interval, which is
+  # harmless here (the sweep is idempotent) but is the kind of thing that stops
+  # being harmless the moment a second periodic task is added. One service, no
+  # replicas, deliberately.
+  beat:
+    image: ${WORKER_IMAGE}
+    command: celery -A app.worker.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@cloudsql-proxy:5432/${DB_NAME}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+      SANDBOX_TIMEOUT: ${SANDBOX_TIMEOUT:-300}
+      ENVIRONMENT: production
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: gcplogs
+
+  # One-shot: `docker compose run --rm migrate`.
+  migrate:
+    image: ${WORKER_IMAGE}
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@cloudsql-proxy:5432/${DB_NAME}
+    depends_on:
+      cloudsql-proxy:
+        condition: service_started
+    profiles: ["tools"]

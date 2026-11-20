@@ -8,6 +8,13 @@ from app.core.config import settings
 engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
+    # Explicit rather than defaulted: this process is one of several (N Cloud
+    # Run instances + the worker) sharing one Postgres, so the pool has to be
+    # sized against that total, not against this process alone. See
+    # Settings.db_pool_size.
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_recycle=settings.db_pool_recycle_seconds,
     future=True,
 )
 

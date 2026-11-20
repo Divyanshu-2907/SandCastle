@@ -29,6 +29,23 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_track_started=True,
     result_expires=60 * 60 * 24,
+    # The sandbox watchdog bounds time spent inside the container. It cannot
+    # bound a clone that hangs on a dead remote or an LLM socket that never
+    # closes, so Celery holds the outer limit. Soft first, so the task raises
+    # SoftTimeLimitExceeded and gets to mark its own run failed; the hard limit
+    # is the kill for when even that wedges.
+    task_soft_time_limit=settings.task_soft_time_limit,
+    task_time_limit=settings.task_time_limit,
+    # A run that was never started (broker lost the message) or never finished
+    # (worker killed) would otherwise sit in `queued`/`running` forever. Redis
+    # is not a durable queue, so this sweep is the only thing that closes those
+    # rows out.
+    beat_schedule={
+        "sweep-stale-runs": {
+            "task": "app.jobs.sweep_stale_runs",
+            "schedule": float(settings.stale_sweep_interval_seconds),
+        },
+    },
 )
 
 

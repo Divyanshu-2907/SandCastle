@@ -10,21 +10,24 @@ import logging
 import shutil
 import tempfile
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from celery.exceptions import SoftTimeLimitExceeded
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from agent.loop import AgentLoop
 from agent.sandbox import SandboxError, sandbox_for
 from agent.schemas import AgentStep
+from agent.tracing import build_tracer, guard
 from agent.workspace import (
     WorkspaceError,
     clone_repo,
     collect_file_diffs_via,
     prepare_git_identity,
 )
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.events import publish_status, publish_step
 from app.models import Diff, Run, RunStatus, Step, StepType
@@ -121,6 +124,13 @@ def run_agent_task(self, run_id: str) -> dict:  # noqa: ANN001 - Celery passes s
         _mark(db, run, RunStatus.RUNNING, started_at=datetime.now(UTC))
 
     recorder = StepRecorder(run_uuid)
+    # A NoopTracer unless both Langfuse keys are configured, so an unconfigured
+    # deployment never imports the SDK, let alone reaches the network.
+    tracer = build_tracer(
+        public_key=settings.langfuse_public_key,
+        secret_key=settings.langfuse_secret_key,
+        host=settings.langfuse_endpoint,
+    )
     root = Path(tempfile.mkdtemp(prefix=f"sandcastle-{run_uuid}-"))
     error: str | None = None
     stop_reason = "error"
@@ -143,6 +153,8 @@ def run_agent_task(self, run_id: str) -> dict:  # noqa: ANN001 - Celery passes s
                 max_steps=max_steps,
                 backend=backend,
                 on_step=recorder,
+                run_id=run_id,
+                tracer=tracer,
             ).run()
 
             error = result.error
@@ -166,11 +178,27 @@ def run_agent_task(self, run_id: str) -> dict:  # noqa: ANN001 - Celery passes s
     except WorkspaceError as exc:
         error = str(exc)
         _record_failure_step(recorder, error)
+    except SoftTimeLimitExceeded:
+        # Celery's outer limit fired: something outside the sandbox hung (a
+        # clone against a dead remote, an LLM socket that never closed). Caught
+        # before the catch-all purely so the run says that, rather than
+        # reporting a bare exception name.
+        error = (
+            f"Run exceeded its {settings.task_soft_time_limit}s task time limit "
+            "and was stopped."
+        )
+        stop_reason = "task_timeout"
+        _record_failure_step(recorder, error)
     except Exception as exc:  # noqa: BLE001 - a bad run must not kill the worker
         logger.exception("run %s crashed", run_id)
         error = f"{type(exc).__name__}: {exc}"
         _record_failure_step(recorder, error)
     finally:
+        # Langfuse batches and exports on a background thread. A Celery task
+        # that returns without flushing can have the worker move on -- or the
+        # process be recycled -- before the batch leaves, losing the trace of
+        # the run that just finished.
+        guard("flush", tracer.flush)
         _cleanup(root)
 
     with SessionLocal() as db:
@@ -226,4 +254,89 @@ def _cleanup(root: Path) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
-__all__ = ["StepRecorder", "run_agent_task", "serialise_step"]
+def _fail_stale(
+    db: Session, status: RunStatus, cutoff_column, cutoff: datetime, message: str, now: datetime
+) -> list[uuid.UUID]:
+    """Fail every run of `status` older than `cutoff`, returning the ids changed.
+
+    One conditional UPDATE rather than select-then-update: the `status` in the
+    WHERE clause is the lock. Two sweepers racing (or a sweeper racing a worker
+    that is finishing normally) cannot both claim the same row, so the loser
+    updates nothing and nobody double-publishes a terminal status.
+    """
+    rows = db.execute(
+        update(Run)
+        .where(and_(Run.status == status, cutoff_column < cutoff))
+        .values(status=RunStatus.FAILED, completed_at=now, error_message=message)
+        .returning(Run.id),
+        # No ORM objects are loaded here and the session is discarded straight
+        # after, so there is no identity map worth synchronising -- and asking
+        # for it would conflict with the RETURNING above.
+        execution_options={"synchronize_session": False},
+    )
+    ids = [row[0] for row in rows]
+    db.commit()
+    return ids
+
+
+@celery_app.task(name="app.jobs.sweep_stale_runs")
+def sweep_stale_runs() -> dict:
+    """Close out runs that no worker is going to finish.
+
+    Two ways a run gets orphaned, neither of which the run itself can report:
+
+    * `queued` forever -- the broker lost the message. Redis is not a durable
+      queue, so a restart or an eviction drops whatever was in flight.
+    * `running` forever -- the worker was SIGKILLed (OOM, VM preemption, a
+      `docker kill`). `finally` does not run, so nothing marks the row.
+
+    Sandbox containers from such a crash are reaped on worker startup; this is
+    the database half of that same cleanup. Deliberately not a retry: there is
+    no checkpoint to resume an agent run from, so the honest outcome is a
+    failed run the user can re-queue, not a silent second attempt.
+
+    A worker that was merely slow, not dead, will overwrite the row when it
+    finishes. That is the right outcome -- the run really did complete -- and
+    the only visible artefact is one spurious `failed` event in between.
+    """
+    now = datetime.now(UTC)
+    with SessionLocal() as db:
+        never_started = _fail_stale(
+            db,
+            RunStatus.QUEUED,
+            Run.created_at,
+            now - timedelta(seconds=settings.queued_stale_after_seconds),
+            f"Never picked up by a worker within {settings.queued_stale_after_seconds}s; "
+            "the queued task was most likely lost. Re-queue the run to try again.",
+            now,
+        )
+        abandoned = _fail_stale(
+            db,
+            RunStatus.RUNNING,
+            # A row can be `running` with a NULL started_at only if the process
+            # died between the two writes; fall back to created_at so it is
+            # still eligible instead of being skipped forever by a NULL compare.
+            func.coalesce(Run.started_at, Run.created_at),
+            now - timedelta(seconds=settings.running_stale_after_seconds),
+            f"No progress for {settings.running_stale_after_seconds}s; the worker "
+            "running it was lost. Re-queue the run to try again.",
+            now,
+        )
+
+    # Published after the commit, same ordering rule as StepRecorder: a client
+    # that reacts by re-reading the run must find the terminal row already
+    # there. This also releases WebSocket clients still waiting on a run whose
+    # worker vanished -- without it they wait for the keepalive to outlive them.
+    for run_id in [*never_started, *abandoned]:
+        publish_status(run_id, RunStatus.FAILED.value, completed_at=now)
+
+    if never_started or abandoned:
+        logger.warning(
+            "swept %d never-started and %d abandoned run(s)",
+            len(never_started),
+            len(abandoned),
+        )
+    return {"never_started": len(never_started), "abandoned": len(abandoned)}
+
+
+__all__ = ["StepRecorder", "run_agent_task", "serialise_step", "sweep_stale_runs"]

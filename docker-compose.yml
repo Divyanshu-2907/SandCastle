@@ -37,6 +37,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # Blank unless set in .env or the shell; blank means tracing stays off.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
@@ -94,6 +99,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # Blank unless set in .env or the shell; blank means tracing stays off.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
       # Never the raw socket -- see docker-socket-proxy above.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-sandcastle-sandbox:latest}
@@ -110,6 +120,29 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+
+  # Runs the periodic schedule defined in app/worker.py -- currently the stale-run
+  # sweeper. Separate from `worker` rather than `worker -B` so that scaling the
+  # worker up never accidentally starts a second scheduler.
+  beat:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    command: celery -A app.worker.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-sandcastle}:${POSTGRES_PASSWORD:-sandcastle}@postgres:5432/${POSTGRES_DB:-sandcastle}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   frontend:
     build:

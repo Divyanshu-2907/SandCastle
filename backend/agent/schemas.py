@@ -30,6 +30,12 @@ class ToolResult:
     text: str
     payload: dict[str, Any]
     is_error: bool = False
+    # A guardrail refused the call, rather than the tool trying and failing.
+    # Both read as errors to the model, but only this one is the sandbox working
+    # as designed, and traces and scores have to tell them apart. Carried as a
+    # field because the alternative is matching on the "Rejected: " prefix of
+    # `text`, which would break the first time that wording changes.
+    blocked: bool = False
 
 
 @dataclass(slots=True)

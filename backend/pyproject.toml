@@ -20,6 +20,9 @@ dependencies = [
     "anthropic>=1.6.0",
     "google-genai>=1.0.0",
     "docker>=7.1.0",
+    # Optional at runtime: tracing stays off unless the Langfuse keys are set,
+    # and the SDK is imported lazily so an untraced run never loads it.
+    "langfuse>=5.2.0",
     "python-jose[cryptography]>=3.3.0",
     "bcrypt>=4.2.0",
     "python-multipart>=0.0.12",
