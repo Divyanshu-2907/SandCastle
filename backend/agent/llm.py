@@ -39,6 +39,14 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # 0 disables pacing (paid tiers, or another provider).
 DEFAULT_GEMINI_RPM = 10
 
+# Pinned rather than left to the SDK's default, which is not stable across
+# releases: google-genai 1.x defaulted the Gemini Developer API to v1beta, and
+# 3.x defaults it to v1 -- where function calling is rejected outright with
+# "Function calling is not enabled for api version v1". The whole agent is tool
+# calls, so the version it talks is a requirement of this code, not a detail to
+# inherit from whatever version of the SDK happens to be installed.
+GEMINI_API_VERSION = "v1beta"
+
 
 class LLMError(Exception):
     """Unrecoverable failure talking to the model provider."""
@@ -240,7 +248,10 @@ class GeminiClient(LLMClient):
         key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not key:
             raise LLMError("GEMINI_API_KEY is not set.")
-        self._client = genai.Client(api_key=key)
+        self._client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(api_version=GEMINI_API_VERSION),
+        )
 
         rpm = (
             requests_per_minute

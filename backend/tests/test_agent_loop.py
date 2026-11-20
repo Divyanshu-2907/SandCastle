@@ -259,6 +259,32 @@ def test_missing_gemini_key_raises_a_clear_error(monkeypatch) -> None:
         build_client(model="gemini-2.5-flash", system_prompt="", tools=TOOL_DEFINITIONS)
 
 
+def test_gemini_client_pins_the_api_version() -> None:
+    """The SDK's default API version is not stable across its own releases.
+
+    google-genai 1.x defaulted the Developer API to v1beta; 3.x defaults it to
+    v1, which rejects function calling with "Function calling is not enabled for
+    api version v1". Every turn this agent takes is a tool call, so an upgrade
+    that changes the default must fail here rather than on a real run.
+    """
+    from agent.llm import GEMINI_API_VERSION, GeminiClient
+
+    assert GEMINI_API_VERSION == "v1beta"
+
+    client = GeminiClient(
+        model="gemini-2.5-flash",
+        system_prompt="system",
+        tools=TOOL_DEFINITIONS,
+        api_key="not-a-real-key",
+        requests_per_minute=0,  # no pacing: nothing here reaches the network
+    )
+    # Reaches into the SDK because the resolved version has no public accessor.
+    # If that internal moves, this test fails loudly, which is the outcome worth
+    # having: it is the only way to see what the client will actually send.
+    resolved = client._client._api_client._http_options.api_version
+    assert resolved == "v1beta", f"client would call the Gemini API at {resolved}"
+
+
 # -- rate limiting and retries -------------------------------------------
 
 
