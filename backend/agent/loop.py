@@ -30,7 +30,14 @@ read, list, and write files and to run shell commands from the repository root.
 
 How to work:
 - Look before you leap: list or read the relevant files before editing anything.
-- `write_file` replaces the whole file, so read a file first and write it back complete.
+- To change a file that already exists, use `edit_file`: give it a snippet that \
+appears exactly once, with enough surrounding lines to be unique. Use `write_file` \
+only to create a new file or to replace a short one outright -- it has to carry the \
+whole file, which is slow and fails outright on large ones.
+- Do not read a file you have already read. You still have its contents; re-reading \
+it only crowds them out.
+- For a long file, read the part you need with `offset` and `limit` rather than all \
+of it.
 - Make the smallest change that accomplishes the task. Match the surrounding style.
 - Verify your work when the repo makes that possible: run the tests, run the linter, \
 or run `git diff` to review what you changed.
@@ -182,6 +189,7 @@ class AgentLoop:
                 guardrail_block_count=self._guardrail_blocks,
                 input_tokens=self._result.input_tokens,
                 output_tokens=self._result.output_tokens,
+                thinking_tokens=self._result.thinking_tokens,
             )
         return self._result
 
@@ -215,10 +223,12 @@ class AgentLoop:
                     stop_reason=response.stop_reason,
                     input_tokens=response.input_tokens,
                     output_tokens=response.output_tokens,
+                    thinking_tokens=response.thinking_tokens,
                 )
 
             self._result.input_tokens += response.input_tokens
             self._result.output_tokens += response.output_tokens
+            self._result.thinking_tokens += response.thinking_tokens
             self._result.stop_reason = response.stop_reason
 
             for thought in response.thoughts:

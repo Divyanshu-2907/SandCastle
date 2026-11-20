@@ -117,8 +117,9 @@ defaults. Notable ones:
 - `GEMINI_API_KEY` — required from Phase 2 on ([free key](https://aistudio.google.com/apikey))
 - `LLM_PROVIDER` / `AGENT_MODEL` — `gemini` + `gemini-2.5-flash` by default
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` — optional run tracing; off unless both are set
-- `GEMINI_THINKING_BUDGET` — ceiling on thinking tokens per turn (default 2048). Thinking is
-  drawn from the same `max_output_tokens` budget as the answer
+- `GEMINI_THINKING_BUDGET` — configurable safeguard, not a fix: a ceiling on thinking tokens
+  per turn (default 2048), since thinking is drawn from the same `max_output_tokens` budget
+  as the answer. It did not cause, and does not fix, any failure observed so far
 
 
 
@@ -220,7 +221,18 @@ docker compose exec backend python run_agent.py \
 Add `--json` for machine-readable output, `--keep` to leave the workspace on disk,
 `--local` to point at a directory instead of a URL.
 
-**Tools:** `read_file`, `write_file`, `list_files`, `run_command`.
+**Tools:** `read_file`, `edit_file`, `write_file`, `list_files`, `run_command`.
+
+`edit_file` replaces one exact snippet and is the tool for changing a file that
+already exists; `write_file` carries the whole file and is for creating one.
+That split is not stylistic. A function-call argument holding an entire file is
+large enough to be rejected: a one-line change to a 707-line README produced a
+`MALFORMED_FUNCTION_CALL` from Gemini and killed the run. `edit_file` refuses
+rather than guesses when its snippet is missing or matches more than once, so an
+ambiguous edit fails loudly instead of changing the wrong line. `read_file`
+takes `offset` and `limit` so a long file can be read in part, and the system
+prompt tells the agent not to re-read a file it already has -- re-reading the
+same README twice is what doubled the context to 27k tokens before it failed.
 
 **Guardrails** ([guardrails.py](backend/agent/guardrails.py)):
 
@@ -471,8 +483,10 @@ One trace per run, built from three kinds of observation:
   so it is seeded from the run id — stable for a given run, but not equal to it.
   Tagged `model:<name>` and `provider:<gemini|anthropic>`.
 - **A `generation` per model turn**, named `turn-1`, `turn-2` and so on. Carries
-  the model name, input/output token usage, the text and thoughts returned, the
-  tool calls requested, and the turn's `stop_reason`. The span wraps the
+  the model name, input/output token usage with thinking broken out separately,
+  the text and thoughts returned, the tool calls requested, and the turn's
+  `stop_reason`. A turn that failed before producing a response still reports
+  the provider's `finish_reason` and what it spent. The span wraps the
   provider call, so its duration is the real latency.
 - **A `tool` span per tool call**, named after the tool. Carries the arguments,
   the result text, `is_error`, and `guardrail_blocked`. A call the guardrails

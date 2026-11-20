@@ -19,7 +19,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "read_file",
         "description": (
             "Read a UTF-8 text file from the repository. Paths are relative to the "
-            "repository root. Returns the file contents with line numbers."
+            "repository root. Returns the file contents with line numbers. Pass "
+            "offset and limit to read part of a large file instead of all of it."
         ),
         "input_schema": {
             "type": "object",
@@ -27,18 +28,53 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "path": {
                     "type": "string",
                     "description": "Path relative to the repository root, e.g. src/main.py",
-                }
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "First line to return, 1-based. Defaults to the start.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many lines to return. Defaults to the whole file.",
+                },
             },
             "required": ["path"],
             "additionalProperties": False,
         },
-        "strict": True,
+    },
+    {
+        "name": "edit_file",
+        "description": (
+            "Replace one exact snippet in an existing file. Use this for changes to "
+            "files that already exist: it sends only the snippet, where write_file "
+            "has to resend the entire file. old_string must appear exactly once -- "
+            "include surrounding lines to make it unique. Fails without writing if "
+            "it is missing or appears more than once."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path relative to the repository root."},
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to replace, including indentation.",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Text to put in its place. Empty string deletes the snippet.",
+                },
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "write_file",
         "description": (
-            "Write a UTF-8 text file, creating parent directories as needed and "
-            "overwriting any existing file. Read a file before rewriting it."
+            "Write a UTF-8 text file whole, creating parent directories as needed "
+            "and overwriting anything already there. Use it for new files and small "
+            "ones; for a change to an existing file prefer edit_file, which does not "
+            "have to resend the entire contents. Read a file before rewriting it."
         ),
         "input_schema": {
             "type": "object",
@@ -111,6 +147,7 @@ class Toolbox:
         handler = {
             "read_file": self._read_file,
             "write_file": self._write_file,
+            "edit_file": self._edit_file,
             "list_files": self._list_files,
             "run_command": self._run_command,
         }.get(name)
@@ -154,11 +191,91 @@ class Toolbox:
                 is_error=True,
             )
 
-        body = truncate(raw, MAX_FILE_CHARS)
-        numbered = "\n".join(f"{i:>5}  {line}" for i, line in enumerate(body.splitlines(), 1))
+        lines = raw.splitlines()
+        total = len(lines)
+        # A window into a long file, so reading one function out of a thousand
+        # lines does not put the whole thousand into the context for every
+        # subsequent turn. Line numbers stay absolute, so they can be quoted back.
+        start = max(1, int(tool_input.get("offset") or 1))
+        limit = tool_input.get("limit")
+        end = start - 1 + int(limit) if limit else total
+        window = lines[start - 1 : end]
+        partial = start > 1 or end < total
+
+        body = truncate("\n".join(window), MAX_FILE_CHARS)
+        numbered = "\n".join(
+            f"{i:>5}  {line}" for i, line in enumerate(body.splitlines(), start)
+        )
+        if partial and window:
+            numbered += f"\n\n[lines {start}-{start + len(window) - 1} of {total}]"
+        elif not window and total:
+            numbered = f"(no lines in range; the file has {total})"
+
         return ToolResult(
             text=numbered or "(empty file)",
-            payload={"path": rel, "bytes": len(raw), "lines": len(raw.splitlines())},
+            payload={
+                "path": rel,
+                "bytes": len(raw),
+                "lines": total,
+                "shown": len(window),
+                "offset": start,
+                "partial": partial,
+            },
+        )
+
+    def _edit_file(self, tool_input: dict[str, Any]) -> ToolResult:
+        """Replace one exact snippet, or refuse and change nothing.
+
+        Refusing on an ambiguous match is the point. A silent replace-the-first
+        would quietly edit the wrong occurrence, and the agent cannot see the
+        file afterwards unless it spends another turn reading it back.
+        """
+        rel = tool_input["path"]
+        old = tool_input["old_string"]
+        new = tool_input["new_string"]
+
+        if not old:
+            return ToolResult(
+                text="old_string must not be empty. Use write_file to create a file.",
+                payload={"error": "empty_old_string", "path": rel},
+                is_error=True,
+            )
+
+        try:
+            raw = self.backend.read_file(rel)
+        except FileNotFound:
+            return ToolResult(
+                text=f"No such file: {rel}. Use write_file to create it.",
+                payload={"error": "not_found", "path": rel},
+                is_error=True,
+            )
+
+        found = raw.count(old)
+        if found == 0:
+            return ToolResult(
+                text=(
+                    f"old_string was not found in {rel}. It must match the file exactly, "
+                    "including indentation and line breaks. Read the file and copy the "
+                    "snippet from it."
+                ),
+                payload={"error": "no_match", "path": rel, "matches": 0},
+                is_error=True,
+            )
+        if found > 1:
+            return ToolResult(
+                text=(
+                    f"old_string matches {found} places in {rel}, so the edit is ambiguous "
+                    "and nothing was changed. Include surrounding lines to make it unique."
+                ),
+                payload={"error": "multiple_matches", "path": rel, "matches": found},
+                is_error=True,
+            )
+
+        self.backend.write_file(rel, raw.replace(old, new, 1))
+        delta = len(new) - len(old)
+        return ToolResult(
+            text=f"Edited {rel} (1 replacement, {delta:+d} bytes).",
+            payload={"path": rel, "matches": 1, "delta_bytes": delta},
         )
 
     def _write_file(self, tool_input: dict[str, Any]) -> ToolResult:

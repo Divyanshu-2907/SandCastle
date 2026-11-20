@@ -47,6 +47,7 @@ class AgentResult:
     error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    thinking_tokens: int = 0
 
     @property
     def step_count(self) -> int:

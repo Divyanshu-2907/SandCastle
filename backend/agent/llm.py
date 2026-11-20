@@ -94,6 +94,10 @@ class LLMResponse:
     stop_reason: str = "end_turn"
     input_tokens: int = 0
     output_tokens: int = 0
+    # Counted inside output_tokens, which is the budget it is drawn from, and
+    # reported separately because it is invisible in the transcript: a turn can
+    # spend most of its output on thinking and show almost nothing for it.
+    thinking_tokens: int = 0
 
     @property
     def joined_text(self) -> str | None:
@@ -351,9 +355,10 @@ class GeminiClient(LLMClient):
         usage = raw.usage_metadata
         if usage is not None:
             response.input_tokens = usage.prompt_token_count or 0
-            response.output_tokens = (usage.candidates_token_count or 0) + (
-                usage.thoughts_token_count or 0
-            )
+            response.thinking_tokens = usage.thoughts_token_count or 0
+            response.output_tokens = (
+                usage.candidates_token_count or 0
+            ) + response.thinking_tokens
         return response
 
     def submit_tool_results(self, outcomes: list[ToolOutcome]) -> None:

@@ -283,6 +283,37 @@ def test_a_failed_turn_reports_the_providers_diagnostics(repo: Path) -> None:
     assert recorded[0]["stop_reason"] == "error"
 
 
+def test_thinking_tokens_are_reported_separately_on_a_good_turn(repo: Path) -> None:
+    """Thinking is counted inside output because that is the budget it spends,
+    but it is invisible in the transcript -- a turn can burn most of its output
+    on thinking and show almost nothing, and the two have to be told apart."""
+    responses = [
+        LLMResponse(
+            text=["done"],
+            stop_reason="end_turn",
+            input_tokens=620,
+            output_tokens=500,
+            thinking_tokens=430,
+        )
+    ]
+    _, tracer = drive(repo, responses)
+
+    turn = next(c for c in tracer.of_kind("record") if "thinking_tokens" in c)
+    assert turn["thinking_tokens"] == 430
+    assert turn["output_tokens"] == 500
+
+    end = tracer.only("end_run")
+    assert end["thinking_tokens"] == 430
+
+
+def test_turn_usage_reports_thinking_from_a_good_turn() -> None:
+    from agent.tracing import _turn_usage, _TurnValues
+
+    values = _TurnValues()
+    values.record(model="m", input_tokens=620, output_tokens=500, thinking_tokens=430)
+    assert _turn_usage(values) == {"input": 620, "output": 500, "thinking": 430}
+
+
 def test_turn_usage_falls_back_to_the_failure_details() -> None:
     """A turn that burned 8,192 thinking tokens and returned nothing must not
     be recorded as having spent zero."""

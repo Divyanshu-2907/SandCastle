@@ -174,6 +174,7 @@ class TurnSink(Protocol):
         stop_reason: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        thinking_tokens: int = 0,
         details: Mapping[str, Any] | None = None,
     ) -> None: ...
 
@@ -213,6 +214,7 @@ class Tracer(Protocol):
         guardrail_block_count: int,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        thinking_tokens: int = 0,
     ) -> None: ...
 
     def flush(self) -> None: ...
@@ -292,6 +294,7 @@ class _TurnValues:
         "stop_reason",
         "input_tokens",
         "output_tokens",
+        "thinking_tokens",
         "failure",
         "details",
     )
@@ -309,6 +312,7 @@ class _TurnValues:
         self.stop_reason: str | None = None
         self.input_tokens = 0
         self.output_tokens = 0
+        self.thinking_tokens = 0
 
     def record(
         self,
@@ -320,6 +324,7 @@ class _TurnValues:
         stop_reason: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        thinking_tokens: int = 0,
         details: Mapping[str, Any] | None = None,
     ) -> None:
         self.model = model
@@ -329,6 +334,7 @@ class _TurnValues:
         self.stop_reason = stop_reason
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
+        self.thinking_tokens = thinking_tokens
         self.details = details
 
 
@@ -355,6 +361,8 @@ def _turn_usage(values: "_TurnValues") -> dict[str, int]:
     burned 8,000 thinking tokens and returned nothing should not read as zero.
     """
     usage = {"input": values.input_tokens, "output": values.output_tokens}
+    if values.thinking_tokens:
+        usage["thinking"] = values.thinking_tokens
     details = values.details or {}
     if not values.input_tokens and details.get("prompt_tokens"):
         usage["input"] = int(details["prompt_tokens"])
@@ -436,6 +444,7 @@ class LangfuseTracer:
         guardrail_block_count: int,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        thinking_tokens: int = 0,
     ) -> None:
         try:
             root = self._root
@@ -454,6 +463,7 @@ class LangfuseTracer:
                         "guardrail_block_count": guardrail_block_count,
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
+                        "thinking_tokens": thinking_tokens,
                     },
                     level="ERROR" if error else "DEFAULT",
                     status_message=redact(error) if error else None,

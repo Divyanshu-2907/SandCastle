@@ -142,6 +142,124 @@ def test_write_file_creates_and_updates(toolbox: Toolbox, repo: Path) -> None:
     assert updated.payload["created"] is False
 
 
+# -- edit_file ------------------------------------------------------------
+#
+# The tool exists because rewriting a file whole means putting the whole file
+# into a function-call argument: a one-line change to a 700-line README was
+# rejected by Gemini as MALFORMED_FUNCTION_CALL and killed the run.
+
+
+def test_edit_file_replaces_one_snippet(toolbox: Toolbox, repo: Path) -> None:
+    result = toolbox.dispatch(
+        "edit_file", {"path": "README.md", "old_string": "Hello.", "new_string": "Goodbye."}
+    )
+    assert not result.is_error, result.text
+    assert result.payload["matches"] == 1
+    assert (repo / "README.md").read_text(encoding="utf-8") == "# Demo\n\nGoodbye.\n"
+
+
+def test_edit_file_can_delete_a_snippet(toolbox: Toolbox, repo: Path) -> None:
+    result = toolbox.dispatch(
+        "edit_file", {"path": "README.md", "old_string": "\nHello.\n", "new_string": "\n"}
+    )
+    assert not result.is_error, result.text
+    assert (repo / "README.md").read_text(encoding="utf-8") == "# Demo\n\n"
+
+
+def test_edit_file_reports_a_missing_snippet_without_writing(
+    toolbox: Toolbox, repo: Path
+) -> None:
+    before = (repo / "README.md").read_text(encoding="utf-8")
+    result = toolbox.dispatch(
+        "edit_file", {"path": "README.md", "old_string": "not in here", "new_string": "x"}
+    )
+    assert result.is_error
+    assert result.payload["error"] == "no_match"
+    assert (repo / "README.md").read_text(encoding="utf-8") == before
+
+
+def test_edit_file_refuses_an_ambiguous_snippet(toolbox: Toolbox, repo: Path) -> None:
+    """Replacing the first of several matches would edit the wrong line silently,
+    and the agent cannot see the file afterwards without spending another turn."""
+    path = repo / "dup.txt"
+    path.write_text("same\nsame\n", encoding="utf-8")
+
+    result = toolbox.dispatch(
+        "edit_file", {"path": "dup.txt", "old_string": "same", "new_string": "changed"}
+    )
+    assert result.is_error
+    assert result.payload["error"] == "multiple_matches"
+    assert result.payload["matches"] == 2
+    assert path.read_text(encoding="utf-8") == "same\nsame\n"
+
+
+def test_edit_file_rejects_an_empty_old_string(toolbox: Toolbox) -> None:
+    result = toolbox.dispatch(
+        "edit_file", {"path": "README.md", "old_string": "", "new_string": "x"}
+    )
+    assert result.is_error
+    assert result.payload["error"] == "empty_old_string"
+
+
+def test_edit_file_on_a_missing_file_is_an_error(toolbox: Toolbox) -> None:
+    result = toolbox.dispatch(
+        "edit_file", {"path": "nope.txt", "old_string": "a", "new_string": "b"}
+    )
+    assert result.is_error
+    assert result.payload["error"] == "not_found"
+
+
+def test_edit_file_cannot_escape_the_workspace(toolbox: Toolbox, tmp_path: Path) -> None:
+    """Same guardrail as write_file: edit_file reaches the filesystem only
+    through the backend, so the path check is the one already in place."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+
+    result = toolbox.dispatch(
+        "edit_file",
+        {"path": "../outside.txt", "old_string": "secret", "new_string": "owned"},
+    )
+    assert result.is_error
+    assert result.blocked is True
+    assert outside.read_text(encoding="utf-8") == "secret\n"
+
+
+# -- read_file ranges -----------------------------------------------------
+
+
+def test_read_file_returns_a_line_range(toolbox: Toolbox, repo: Path) -> None:
+    (repo / "long.txt").write_text("\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8")
+
+    result = toolbox.dispatch("read_file", {"path": "long.txt", "offset": 10, "limit": 3})
+    assert not result.is_error, result.text
+    assert result.payload["shown"] == 3
+    assert result.payload["lines"] == 100
+    assert result.payload["partial"] is True
+    # Numbers stay absolute so the agent can quote them back.
+    assert "   10  line 10" in result.text
+    assert "   12  line 12" in result.text
+    assert "line 13" not in result.text
+    assert "[lines 10-12 of 100]" in result.text
+
+
+def test_read_file_without_a_range_is_unchanged(toolbox: Toolbox) -> None:
+    result = toolbox.dispatch("read_file", {"path": "README.md"})
+    assert result.payload["partial"] is False
+    assert "    1  # Demo" in result.text
+
+
+def test_read_file_range_past_the_end_is_not_a_crash(toolbox: Toolbox) -> None:
+    result = toolbox.dispatch("read_file", {"path": "README.md", "offset": 999, "limit": 5})
+    assert not result.is_error
+    assert result.payload["shown"] == 0
+    assert "no lines in range" in result.text
+
+
+def test_read_file_limit_longer_than_the_file_returns_all_of_it(toolbox: Toolbox) -> None:
+    result = toolbox.dispatch("read_file", {"path": "README.md", "offset": 1, "limit": 500})
+    assert result.payload["shown"] == result.payload["lines"]
+
+
 def test_list_files_skips_git_directory(toolbox: Toolbox) -> None:
     result = toolbox.dispatch("list_files", {"directory": ".", "recursive": True})
     assert "src/app.py" in result.text
