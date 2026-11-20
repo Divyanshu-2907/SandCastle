@@ -3,6 +3,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -283,6 +284,156 @@ def test_gemini_client_pins_the_api_version() -> None:
     # having: it is the only way to see what the client will actually send.
     resolved = client._client._api_client._http_options.api_version
     assert resolved == "v1beta", f"client would call the Gemini API at {resolved}"
+
+
+# -- the thinking budget, and what an empty response reports --------------
+
+
+def _gemini_client(**kwargs):
+    from agent.llm import GeminiClient
+
+    return GeminiClient(
+        model="gemini-2.5-flash",
+        system_prompt="system",
+        tools=TOOL_DEFINITIONS,
+        api_key="not-a-real-key",
+        requests_per_minute=0,
+        **kwargs,
+    )
+
+
+def _fake_response(
+    *,
+    finish_reason: str | None = "MAX_TOKENS",
+    parts=None,
+    content_missing: bool = False,
+    candidates_tokens=None,
+    thoughts_tokens=None,
+    prompt_tokens=13_808,
+    block_reason=None,
+):
+    """A generate_content result shaped like the ones that broke a real run."""
+    content = None if content_missing else SimpleNamespace(parts=parts)
+    candidate = SimpleNamespace(content=content, finish_reason=finish_reason)
+    return SimpleNamespace(
+        candidates=[candidate],
+        prompt_feedback=SimpleNamespace(block_reason=block_reason),
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=prompt_tokens,
+            candidates_token_count=candidates_tokens,
+            thoughts_token_count=thoughts_tokens,
+            total_token_count=(prompt_tokens or 0)
+            + (candidates_tokens or 0)
+            + (thoughts_tokens or 0),
+        ),
+    )
+
+
+def test_thinking_budget_is_configured_by_default() -> None:
+    """Thinking is drawn from max_output_tokens, so it needs a ceiling: with
+    none, a long deliberation can leave nothing for the answer."""
+    from agent.llm import DEFAULT_GEMINI_THINKING_BUDGET
+
+    assert DEFAULT_GEMINI_THINKING_BUDGET == 2048
+    client = _gemini_client()
+    assert client._config.thinking_config.thinking_budget == 2048
+    assert client._config.max_output_tokens == 8192
+
+
+def test_thinking_budget_reads_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_THINKING_BUDGET", "512")
+    assert _gemini_client()._config.thinking_config.thinking_budget == 512
+
+
+def test_an_explicit_thinking_budget_beats_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_THINKING_BUDGET", "512")
+    assert _gemini_client(thinking_budget=0)._config.thinking_config.thinking_budget == 0
+
+
+def test_an_empty_parts_response_fails_the_turn(monkeypatch) -> None:
+    """Previously this returned quietly.
+
+    A MAX_TOKENS response whose budget all went to thinking arrives with content
+    set and `parts` empty. The old loop iterated nothing, set no final message
+    and raised nothing, so the run was stored as completed having done nothing.
+    """
+    from agent.llm import LLMError
+
+    client = _gemini_client()
+    monkeypatch.setattr(
+        client._client.models,
+        "generate_content",
+        lambda **_kw: _fake_response(parts=[], candidates_tokens=None, thoughts_tokens=8192),
+    )
+    with pytest.raises(LLMError) as caught:
+        client.advance()
+    assert "MAX_TOKENS" in str(caught.value)
+
+
+def test_a_failed_turn_records_why(monkeypatch) -> None:
+    """The diagnostics are the whole point: without them the only record of a
+    run dying here was "block_reason=None", which says nothing."""
+    from agent.llm import LLMError
+
+    client = _gemini_client()
+    monkeypatch.setattr(
+        client._client.models,
+        "generate_content",
+        lambda **_kw: _fake_response(
+            finish_reason="MAX_TOKENS", parts=[], thoughts_tokens=8192, prompt_tokens=13_808
+        ),
+    )
+    with pytest.raises(LLMError) as caught:
+        client.advance()
+
+    details = caught.value.details
+    assert details["finish_reason"] == "MAX_TOKENS"
+    assert details["thoughts_tokens"] == 8192
+    assert details["prompt_tokens"] == 13_808
+    assert details["part_count"] == 0
+    assert details["max_output_tokens"] == 8192
+    assert details["thinking_budget"] == 2048
+
+    message = str(caught.value)
+    assert "finish_reason=MAX_TOKENS" in message
+    assert "thinking_tokens=8192" in message
+    # block_reason is a safety field; naming it for a budget failure was noise.
+    assert "block_reason" not in message
+
+
+def test_a_safety_block_still_names_the_block_reason(monkeypatch) -> None:
+    from agent.llm import LLMError
+
+    client = _gemini_client()
+    monkeypatch.setattr(
+        client._client.models,
+        "generate_content",
+        lambda **_kw: _fake_response(
+            finish_reason="SAFETY", content_missing=True, block_reason="SAFETY"
+        ),
+    )
+    with pytest.raises(LLMError) as caught:
+        client.advance()
+    assert "finish_reason=SAFETY" in str(caught.value)
+    assert "block_reason=SAFETY" in str(caught.value)
+
+
+def test_a_normal_response_still_works(monkeypatch) -> None:
+    """The empty-parts guard must not reject a healthy turn."""
+    client = _gemini_client()
+    part = SimpleNamespace(function_call=None, text="all done", thought=False)
+    monkeypatch.setattr(
+        client._client.models,
+        "generate_content",
+        lambda **_kw: _fake_response(
+            finish_reason="STOP", parts=[part], candidates_tokens=12, thoughts_tokens=30
+        ),
+    )
+    response = client.advance()
+    assert response.text == ["all done"]
+    assert response.stop_reason == "end_turn"
+    # Thinking is counted as output spend, because that is the budget it uses.
+    assert response.output_tokens == 42
 
 
 # -- rate limiting and retries -------------------------------------------

@@ -190,7 +190,19 @@ class AgentLoop:
             # The span wraps the call rather than being written afterwards, so
             # its duration is the model's actual latency.
             with guard_turn(self.tracer, number=turn) as turn_trace:
-                response = self.client.advance()
+                try:
+                    response = self.client.advance()
+                except LLMError as exc:
+                    # Record before re-raising: the provider said why it failed
+                    # (finish reason, tokens spent on thinking), and that is the
+                    # only place those numbers exist -- there is no response to
+                    # read them off afterwards.
+                    turn_trace.record(
+                        model=self.model,
+                        stop_reason="error",
+                        details=getattr(exc, "details", None),
+                    )
+                    raise
                 self._turns_used = turn
                 turn_trace.record(
                     model=self.model,

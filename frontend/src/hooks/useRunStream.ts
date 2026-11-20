@@ -10,6 +10,7 @@ interface RunStream {
   steps: Step[]
   diffs: Diff[]
   status: RunStatus | null
+  stopReason: string | null
   connection: ConnectionState
   error: string | null
   reload: () => void
@@ -30,6 +31,9 @@ export function useRunStream(runId: string | undefined): RunStream {
   const [steps, setSteps] = useState<Step[]>([])
   const [diffs, setDiffs] = useState<Diff[]>([])
   const [status, setStatus] = useState<RunStatus | null>(null)
+  // Tracked beside the status: the terminal event carries it before the
+  // run row is re-fetched, so the badge can say why it stopped right away.
+  const [stopReason, setStopReason] = useState<string | null>(null)
   const [connection, setConnection] = useState<ConnectionState>('connecting')
   const [error, setError] = useState<string | null>(null)
 
@@ -51,6 +55,7 @@ export function useRunStream(runId: string | undefined): RunStream {
       const detail = await api.getRun(runId)
       setRun(detail)
       setStatus(detail.status)
+      setStopReason(detail.stop_reason)
       setDiffs(detail.diffs)
       detail.steps.forEach(mergeStep)
       setError(null)
@@ -66,6 +71,7 @@ export function useRunStream(runId: string | undefined): RunStream {
     setSteps([])
     setDiffs([])
     setStatus(null)
+    setStopReason(null)
     setError(null)
     setConnection('connecting')
     retryRef.current = 0
@@ -97,6 +103,9 @@ export function useRunStream(runId: string | undefined): RunStream {
           mergeStep(message.data)
         } else if (message.event === 'status') {
           setStatus(message.data.status)
+          if (message.data.stop_reason !== undefined) {
+            setStopReason(message.data.stop_reason ?? null)
+          }
           if (isTerminal(message.data.status)) {
             // Diffs and final metadata are only written once the run ends, and
             // they come over REST rather than the stream.
@@ -147,5 +156,5 @@ export function useRunStream(runId: string | undefined): RunStream {
     }
   }, [runId, mergeStep, loadRun])
 
-  return { run, steps, diffs, status, connection, error, reload: loadRun }
+  return { run, steps, diffs, status, stopReason, connection, error, reload: loadRun }
 }

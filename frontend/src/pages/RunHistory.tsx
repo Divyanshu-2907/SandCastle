@@ -103,7 +103,7 @@ export function RunHistory() {
             {runs.map((run) => (
               <tr key={run.id}>
                 <td>
-                  <StatusBadge status={run.status} />
+                  <StatusBadge status={run.status} stopReason={run.stop_reason} />
                 </td>
                 <td className="table__main">
                   <Link to={`/runs/${run.id}`}>{run.task.description}</Link>

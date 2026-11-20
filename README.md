@@ -117,6 +117,8 @@ defaults. Notable ones:
 - `GEMINI_API_KEY` — required from Phase 2 on ([free key](https://aistudio.google.com/apikey))
 - `LLM_PROVIDER` / `AGENT_MODEL` — `gemini` + `gemini-2.5-flash` by default
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` — optional run tracing; off unless both are set
+- `GEMINI_THINKING_BUDGET` — ceiling on thinking tokens per turn (default 2048). Thinking is
+  drawn from the same `max_output_tokens` budget as the answer
 
 
 

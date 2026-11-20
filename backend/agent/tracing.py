@@ -56,11 +56,18 @@ COUNT_KEY_NAMES = frozenset(
         "total_tokens",
         "prompt_tokens",
         "completion_tokens",
+        "candidates_tokens",
         "thoughts_tokens",
+        "thinking_tokens",
+        "visible_tokens",
         "cached_tokens",
         "max_tokens",
         "max_output_tokens",
         "token_count",
+        "prompt_token_count",
+        "candidates_token_count",
+        "thoughts_token_count",
+        "total_token_count",
     }
 )
 
@@ -167,6 +174,7 @@ class TurnSink(Protocol):
         stop_reason: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        details: Mapping[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -285,12 +293,15 @@ class _TurnValues:
         "input_tokens",
         "output_tokens",
         "failure",
+        "details",
     )
 
     def __init__(self) -> None:
         # Set when the traced work raised. The span's level is decided once, at
         # close: an earlier update would be overwritten by the closing one.
         self.failure: str | None = None
+        # Whatever the provider said about a call that produced no response.
+        self.details: Mapping[str, Any] | None = None
         self.model: str | None = None
         self.thoughts: Sequence[str] = ()
         self.text: Sequence[str] = ()
@@ -309,6 +320,7 @@ class _TurnValues:
         stop_reason: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.thoughts = thoughts
@@ -317,6 +329,7 @@ class _TurnValues:
         self.stop_reason = stop_reason
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
+        self.details = details
 
 
 class _ToolValues:
@@ -332,6 +345,27 @@ class _ToolValues:
         self.text = text
         self.is_error = is_error
         self.blocked = blocked
+
+
+def _turn_usage(values: "_TurnValues") -> dict[str, int]:
+    """Token usage for one turn, from the response or from a failure's details.
+
+    A call that raised has no response to count, but the provider still reported
+    what it spent -- which is the whole point of capturing details: a turn that
+    burned 8,000 thinking tokens and returned nothing should not read as zero.
+    """
+    usage = {"input": values.input_tokens, "output": values.output_tokens}
+    details = values.details or {}
+    if not values.input_tokens and details.get("prompt_tokens"):
+        usage["input"] = int(details["prompt_tokens"])
+    if not values.output_tokens:
+        spent = (details.get("candidates_tokens") or 0) + (details.get("thoughts_tokens") or 0)
+        if spent:
+            usage["output"] = int(spent)
+    if details.get("thoughts_tokens"):
+        # Broken out so thinking spend is filterable on its own in Langfuse.
+        usage["thinking"] = int(details["thoughts_tokens"])
+    return usage
 
 
 class LangfuseTracer:
@@ -506,8 +540,8 @@ class LangfuseTracer:
                         ],
                     }
                 ),
-                usage_details={"input": values.input_tokens, "output": values.output_tokens},
-                metadata={"stop_reason": values.stop_reason},
+                usage_details=_turn_usage(values),
+                metadata={"stop_reason": values.stop_reason, **dict(values.details or {})},
             )
             span.end()
         except Exception:  # noqa: BLE001

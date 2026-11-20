@@ -100,6 +100,7 @@ def _mark(db: Session, run: Run, status: RunStatus, **fields) -> None:
         error_message=fields.get("error_message"),
         started_at=fields.get("started_at"),
         completed_at=fields.get("completed_at"),
+        stop_reason=fields.get("stop_reason"),
     )
 
 
@@ -210,6 +211,9 @@ def run_agent_task(self, run_id: str) -> dict:  # noqa: ANN001 - Celery passes s
                 RunStatus.FAILED if error else RunStatus.COMPLETED,
                 completed_at=datetime.now(UTC),
                 error_message=error,
+                # Recorded alongside the status, not folded into it: running out
+                # of turns is not an error, but it is not success either.
+                stop_reason=stop_reason,
             )
 
     return {

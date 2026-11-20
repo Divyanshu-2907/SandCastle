@@ -163,6 +163,39 @@ def test_run_accepts_per_run_overrides(auth_client: TestClient) -> None:
     assert detail["max_steps"] == 3
 
 
+def test_stop_reason_is_stored_and_returned(auth_client: TestClient, db) -> None:
+    """`status` says only whether anything threw.
+
+    A run that exhausted its step budget raises nothing, so it is stored as
+    completed while having changed no files. `stop_reason` is what separates
+    that from a run that finished the task, and the UI needs it to say so.
+    """
+    import uuid as _uuid
+
+    from app.models import Run, RunStatus
+
+    task_id = auth_client.post("/tasks", json=GOOD_TASK).json()["id"]
+    run_id = auth_client.post(f"/tasks/{task_id}/runs", json={}).json()["id"]
+
+    run = db.get(Run, _uuid.UUID(run_id))
+    run.status = RunStatus.COMPLETED
+    run.stop_reason = "max_steps"
+    db.commit()
+
+    detail = auth_client.get(f"/runs/{run_id}").json()
+    assert detail["status"] == "completed"
+    assert detail["stop_reason"] == "max_steps"
+
+    listed = next(r for r in auth_client.get("/runs").json() if r["id"] == run_id)
+    assert listed["stop_reason"] == "max_steps"
+
+
+def test_stop_reason_is_null_before_a_run_finishes(auth_client: TestClient) -> None:
+    task_id = auth_client.post("/tasks", json=GOOD_TASK).json()["id"]
+    run_id = auth_client.post(f"/tasks/{task_id}/runs", json={}).json()["id"]
+    assert auth_client.get(f"/runs/{run_id}").json()["stop_reason"] is None
+
+
 def test_max_steps_is_bounded(auth_client: TestClient) -> None:
     task_id = auth_client.post("/tasks", json=GOOD_TASK).json()["id"]
     for bad in [0, -1, 500]:

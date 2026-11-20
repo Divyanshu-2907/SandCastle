@@ -48,6 +48,11 @@ class Run(Base, UUIDPrimaryKey, CreatedAt):
         Integer, default=DEFAULT_MAX_STEPS, server_default=str(DEFAULT_MAX_STEPS), nullable=False
     )
     error_message: Mapped[str | None] = mapped_column(Text)
+    # Why the agent stopped, as the loop saw it: end_turn, max_steps,
+    # sandbox_timeout, task_timeout, error. `status` only says whether
+    # anything threw, so a run that merely ran out of turns is COMPLETED
+    # with nothing done; this is the column that tells them apart.
+    stop_reason: Mapped[str | None] = mapped_column(String(64))
 
     task: Mapped["Task"] = relationship(back_populates="runs")
     steps: Mapped[list["Step"]] = relationship(

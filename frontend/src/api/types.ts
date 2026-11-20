@@ -49,6 +49,7 @@ export interface RunSummary {
   started_at: string | null
   completed_at: string | null
   error_message: string | null
+  stop_reason: string | null
   task: Task
 }
 
@@ -66,7 +67,10 @@ export interface RunCreated {
 /** Frames pushed over /ws/runs/{id}. `ping` is a keepalive and can be ignored. */
 export type RunEvent =
   | { event: 'step'; data: Step }
-  | { event: 'status'; data: { status: RunStatus; error_message?: string | null } }
+  | {
+      event: 'status'
+      data: { status: RunStatus; error_message?: string | null; stop_reason?: string | null }
+    }
   | { event: 'ping'; data: Record<string, never> }
 
 export const TERMINAL_STATUSES: RunStatus[] = ['completed', 'failed']

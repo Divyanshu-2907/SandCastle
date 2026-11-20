@@ -32,6 +32,7 @@ const RUN: RunDetail = {
   started_at: new Date().toISOString(),
   completed_at: null,
   error_message: null,
+  stop_reason: null,
   task: {
     id: 'task-1',
     repo_url: 'https://github.com/octocat/Hello-World.git',

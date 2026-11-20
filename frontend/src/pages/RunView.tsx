@@ -25,7 +25,7 @@ function elapsed(startedAt: string | null, completedAt: string | null, now: numb
 
 export function RunView() {
   const { runId } = useParams<{ runId: string }>()
-  const { run, steps, diffs, status, connection, error } = useRunStream(runId)
+  const { run, steps, diffs, status, stopReason, connection, error } = useRunStream(runId)
 
   // Drives the live duration counter while a run is in flight.
   const [now, setNow] = useState(() => Date.now())
@@ -68,7 +68,7 @@ export function RunView() {
     <div className="page runview">
       <header className="runview__head">
         <div className="runview__title">
-          <StatusBadge status={status} live={connection === 'live'} />
+          <StatusBadge status={status} stopReason={stopReason} live={connection === 'live'} />
           <h1>{run.task.description}</h1>
         </div>
         <a className="runview__repo" href={run.task.repo_url} target="_blank" rel="noreferrer">

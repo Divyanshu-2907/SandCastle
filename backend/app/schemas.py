@@ -133,6 +133,7 @@ class RunSummary(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     error_message: str | None
+    stop_reason: str | None = None
     task: TaskRead
 
 

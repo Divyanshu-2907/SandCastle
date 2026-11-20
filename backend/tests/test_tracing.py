@@ -250,6 +250,55 @@ def test_hitting_the_step_limit_scores_zero(repo: Path) -> None:
     assert run_completed_score(end["error"], end["stop_reason"]) == 0
 
 
+def test_a_failed_turn_reports_the_providers_diagnostics(repo: Path) -> None:
+    """The failing call is the one worth understanding, and it is the only one
+    with no response to read numbers off. They ride on the exception instead."""
+    details = {
+        "finish_reason": "MAX_TOKENS",
+        "thoughts_tokens": 8192,
+        "prompt_tokens": 13808,
+        "part_count": 0,
+    }
+
+    class FailingClient(ScriptedClient):
+        def advance(self) -> LLMResponse:
+            raise LLMError("Gemini returned no usable content", details)
+
+    tracer = FakeTracer()
+    result = AgentLoop(
+        workspace=repo,
+        description="d",
+        model="m",
+        max_steps=3,
+        client=FailingClient([]),
+        tracer=tracer,
+        run_id="run-details",
+    ).run()
+
+    assert result.error is not None
+    recorded = [c for c in tracer.of_kind("record") if c.get("details")]
+    assert len(recorded) == 1, "the failing turn recorded no diagnostics"
+    assert recorded[0]["details"]["finish_reason"] == "MAX_TOKENS"
+    assert recorded[0]["details"]["thoughts_tokens"] == 8192
+    assert recorded[0]["stop_reason"] == "error"
+
+
+def test_turn_usage_falls_back_to_the_failure_details() -> None:
+    """A turn that burned 8,192 thinking tokens and returned nothing must not
+    be recorded as having spent zero."""
+    from agent.tracing import _turn_usage, _TurnValues
+
+    values = _TurnValues()
+    values.record(
+        model="m",
+        details={"prompt_tokens": 13808, "candidates_tokens": None, "thoughts_tokens": 8192},
+    )
+    usage = _turn_usage(values)
+    assert usage["input"] == 13808
+    assert usage["output"] == 8192
+    assert usage["thinking"] == 8192
+
+
 def test_end_run_fires_once_when_the_provider_fails(repo: Path) -> None:
     """The crash path is the one where an unclosed trace would matter most."""
     result, tracer = drive(repo, [], raise_on_advance=True)
@@ -458,6 +507,24 @@ def test_token_counts_survive_redaction() -> None:
     assert out == {"input_tokens": 120, "output_tokens": 30, "total_tokens": 150}
     for name in COUNT_KEY_NAMES:
         assert redact({name: 7})[name] == 7
+
+
+def test_every_diagnostic_field_survives_redaction() -> None:
+    """The guard that generalises the token-count exemption.
+
+    `candidates_tokens` contains "token" and was being masked to "[redacted]"
+    in real traces -- the exact data the failure path exists to capture. Asserts
+    against the diagnostics the Gemini client actually emits, so adding a field
+    whose name trips the secret matcher fails here rather than in production.
+    """
+    from agent.llm import _gemini_diagnostics
+
+    diagnostics = _gemini_diagnostics(None, None, thinking_budget=2048)
+    # Fill every slot with a number so a masked one is unmistakable.
+    sample = {key: 123 for key in diagnostics}
+    out = redact(sample)
+    masked = sorted(k for k, v in out.items() if v == REDACTED)
+    assert not masked, f"diagnostics lost to the mask: {masked}"
 
 
 def test_long_tool_arguments_are_truncated() -> None:

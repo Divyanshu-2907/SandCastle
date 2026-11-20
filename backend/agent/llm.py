@@ -47,9 +47,27 @@ DEFAULT_GEMINI_RPM = 10
 # inherit from whatever version of the SDK happens to be installed.
 GEMINI_API_VERSION = "v1beta"
 
+# Thinking tokens are drawn from the same max_output_tokens budget as the visible
+# answer, and they are not small: measured at 1,487 thinking against 1,461 visible
+# on a trivial prompt. Starve the budget and thinking takes all of it -- at 30
+# tokens the model spent 27 on thinking, returned no content, and finished
+# MAX_TOKENS. Capping thinking keeps room for an answer no matter how long the
+# model deliberates. 0 disables thinking; -1 hands the budget back to the model.
+DEFAULT_GEMINI_THINKING_BUDGET = 2048
+
 
 class LLMError(Exception):
-    """Unrecoverable failure talking to the model provider."""
+    """Unrecoverable failure talking to the model provider.
+
+    `details` carries whatever the provider said about *why*, for a failure that
+    happens before there is an `LLMResponse` to put it on. A run that died on an
+    empty candidate used to record nothing at all -- no finish reason, no token
+    counts -- so the one question worth asking afterwards had no answer.
+    """
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details: dict[str, Any] = details or {}
 
 
 @dataclass(slots=True)
@@ -238,6 +256,7 @@ class GeminiClient(LLMClient):
         tools: list[dict[str, Any]],
         api_key: str | None = None,
         requests_per_minute: int | None = None,
+        thinking_budget: int | None = None,
     ) -> None:
         super().__init__(model, system_prompt, tools)
 
@@ -268,6 +287,11 @@ class GeminiClient(LLMClient):
             )
             for tool in tools
         ]
+        self._thinking_budget = (
+            thinking_budget
+            if thinking_budget is not None
+            else int(os.getenv("GEMINI_THINKING_BUDGET", DEFAULT_GEMINI_THINKING_BUDGET))
+        )
         self._config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             tools=[types.Tool(function_declarations=declarations)],
@@ -275,6 +299,9 @@ class GeminiClient(LLMClient):
             # calls so every one passes a guardrail check first.
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             max_output_tokens=MAX_OUTPUT_TOKENS,
+            # Bounds the share of max_output_tokens thinking may take, so a long
+            # deliberation cannot leave zero room for the answer or the tool call.
+            thinking_config=types.ThinkingConfig(thinking_budget=self._thinking_budget),
         )
         self._contents: list[Any] = []
         self._call_names: dict[str, str] = {}
@@ -296,15 +323,21 @@ class GeminiClient(LLMClient):
             raise LLMError(_describe_gemini_error(exc, self.model)) from exc
 
         candidate = (raw.candidates or [None])[0]
-        if candidate is None or candidate.content is None:
-            blocked = getattr(raw.prompt_feedback, "block_reason", None)
-            raise LLMError(f"Gemini returned no candidate (block_reason={blocked}).")
+        content = getattr(candidate, "content", None)
+        parts = list(getattr(content, "parts", None) or [])
+        # Empty `parts` counts as a failure, not a quiet finish. A MAX_TOKENS
+        # response whose whole budget went to thinking arrives with content set
+        # and parts empty; iterating it produced no steps, no final message and
+        # no error, so the run was recorded as completed having done nothing.
+        if candidate is None or content is None or not parts:
+            details = _gemini_diagnostics(raw, candidate, self._thinking_budget)
+            raise LLMError(_describe_empty_gemini_response(details), details)
 
         # Echo the model's own turn back verbatim on the next request.
-        self._contents.append(candidate.content)
+        self._contents.append(content)
 
         response = LLMResponse(stop_reason=_gemini_stop_reason(candidate.finish_reason))
-        for part in candidate.content.parts or []:
+        for part in parts:
             if part.function_call is not None:
                 call = part.function_call
                 call_id = call.id or f"{call.name}-{len(self._call_names)}"
@@ -333,6 +366,66 @@ class GeminiClient(LLMClient):
             for outcome in outcomes
         ]
         self._contents.append(types.Content(role="user", parts=parts))
+
+
+def _enum_name(value: Any) -> str | None:
+    """`FinishReason.MAX_TOKENS` -> "MAX_TOKENS"; passes plain strings through."""
+    if value is None:
+        return None
+    return getattr(value, "name", None) or str(value)
+
+
+def _gemini_diagnostics(raw: Any, candidate: Any, thinking_budget: int) -> dict[str, Any]:
+    """Everything the response says about why it carried nothing usable.
+
+    Read off the raw response rather than an `LLMResponse`, because the failure
+    happens before one exists. Every lookup is defensive: this runs on the error
+    path, where the shape is by definition not what was expected.
+    """
+    usage = getattr(raw, "usage_metadata", None)
+    content = getattr(candidate, "content", None)
+    parts = getattr(content, "parts", None)
+    return {
+        "finish_reason": _enum_name(getattr(candidate, "finish_reason", None)),
+        "block_reason": _enum_name(getattr(getattr(raw, "prompt_feedback", None), "block_reason", None)),
+        "candidate_count": len(getattr(raw, "candidates", None) or []),
+        "has_content": content is not None,
+        "part_count": len(parts or []),
+        "prompt_tokens": getattr(usage, "prompt_token_count", None),
+        "candidates_tokens": getattr(usage, "candidates_token_count", None),
+        "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+        "total_tokens": getattr(usage, "total_token_count", None),
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "thinking_budget": thinking_budget,
+    }
+
+
+def _describe_empty_gemini_response(details: dict[str, Any]) -> str:
+    """One line naming the actual reason.
+
+    The old message reported `block_reason`, which is a *safety* field and is
+    None for every failure that is not a safety block -- so it said nothing at
+    all about the common cases. Lead with the finish reason instead.
+    """
+    finish = details.get("finish_reason") or "unknown"
+    parts = [f"Gemini returned no usable content (finish_reason={finish}"]
+    thoughts = details.get("thoughts_tokens")
+    if thoughts is not None:
+        parts.append(f", thinking_tokens={thoughts}/{details.get('thinking_budget')}")
+    visible = details.get("candidates_tokens")
+    if visible is not None:
+        parts.append(f", visible_tokens={visible}")
+    if details.get("block_reason"):
+        parts.append(f", block_reason={details['block_reason']}")
+    parts.append(").")
+    if finish == "MAX_TOKENS":
+        parts.append(
+            " The output budget ran out before the model produced anything;"
+            " thinking tokens are drawn from the same budget."
+        )
+    elif finish in {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"}:
+        parts.append(" The model's tool call was rejected by the API before it reached us.")
+    return "".join(parts)
 
 
 def _gemini_stop_reason(finish_reason: Any) -> str:
